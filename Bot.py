@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-import openai
+import google.generativeai as genai
 import os
 import json
 from datetime import datetime
@@ -11,10 +11,11 @@ import PyPDF2
 
 # Load environment variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))  # Specific channel ID
 
-openai.api_key = OPENAI_API_KEY
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize bot
 intents = discord.Intents.default()
@@ -22,7 +23,7 @@ intents.message_content = True
 intents.messages = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Chat history storage (use database for production)
+# Chat history storage
 chat_histories = {}
 
 def load_history():
@@ -61,37 +62,41 @@ async def on_message(message):
     # Process the message
     async with message.channel.typing():
         try:
-            # Build conversation context
-            messages = [
-                {"role": "system", "content": "You are a helpful Discord bot assistant. You can view images and read files. Be friendly and concise."}
-            ]
+            # Initialize Gemini model
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
             
-            # Add chat history (last 10 messages)
+            # Build conversation history for context
+            conversation_context = "You are a helpful Discord bot assistant. Be friendly and concise.\n\n"
+            
+            # Add last 10 messages from history
             for hist in chat_histories[user_id][-10:]:
-                messages.append({"role": "user", "content": hist["user"]})
-                messages.append({"role": "assistant", "content": hist["bot"]})
+                conversation_context += f"User: {hist['user']}\nBot: {hist['bot']}\n\n"
             
-            # Current message content
-            current_content = []
-            current_content.append({"type": "text", "text": message.content or "No text provided"})
+            # Prepare content parts for current message
+            content_parts = []
             
-            # Handle image attachments
+            # Add text message
+            if message.content:
+                content_parts.append(conversation_context + f"User: {message.content}\nBot:")
+            else:
+                content_parts.append(conversation_context + "User: [Sent attachment(s)]\nBot:")
+            
+            # Handle attachments
             for attachment in message.attachments:
+                # Handle images
                 if attachment.content_type and attachment.content_type.startswith('image/'):
-                    current_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": attachment.url}
-                    })
-                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(attachment.url) as resp:
+                            image_data = await resp.read()
+                            img = Image.open(io.BytesIO(image_data))
+                            content_parts.append(img)
+                
                 # Handle text files
                 elif attachment.filename.endswith(('.txt', '.py', '.js', '.html', '.css', '.json')):
                     async with aiohttp.ClientSession() as session:
                         async with session.get(attachment.url) as resp:
                             file_content = await resp.text()
-                            current_content.append({
-                                "type": "text",
-                                "text": f"\n\n[File: {attachment.filename}]\n{file_content[:2000]}"
-                            })
+                            content_parts[0] += f"\n\n[File: {attachment.filename}]\n{file_content[:3000]}"
                 
                 # Handle PDF files
                 elif attachment.filename.endswith('.pdf'):
@@ -102,21 +107,11 @@ async def on_message(message):
                             pdf_text = ""
                             for page in pdf_reader.pages[:5]:  # First 5 pages
                                 pdf_text += page.extract_text()
-                            current_content.append({
-                                "type": "text",
-                                "text": f"\n\n[PDF: {attachment.filename}]\n{pdf_text[:2000]}"
-                            })
+                            content_parts[0] += f"\n\n[PDF: {attachment.filename}]\n{pdf_text[:3000]}"
             
-            messages.append({"role": "user", "content": current_content})
-            
-            # Call OpenAI API
-            response = openai.chat.completions.create(
-                model="gpt-4-vision-preview" if any(c.get("type") == "image_url" for c in current_content) else "gpt-4-turbo-preview",
-                messages=messages,
-                max_tokens=1000
-            )
-            
-            bot_response = response.choices[0].message.content
+            # Generate response from Gemini
+            response = model.generate_content(content_parts)
+            bot_response = response.text
             
             # Save to history
             chat_histories[user_id].append({
